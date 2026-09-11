@@ -7,12 +7,18 @@
  * logic in ../src/client.ts with the CLI; the only thing here is tool wiring.
  *
  * Every tool maps to a specific operation, and there is no raw request/path
- * escape hatch — so an agent driving it can never reach an unintended
- * endpoint. All tools are reads except two deliberate writes: `create_activity`
- * and `update_activity`, both gated on an explicit `confirm: true` so an agent
- * has to surface the details to its user before writing. The chat/email tools
- * are GraphQL reads only — `SignIn` mints an auth token but writes no data,
- * and no generic GraphQL tool is exposed.
+ * escape hatch. All tools are reads except three deliberate writes:
+ * `create_activity`, `update_activity` and `respond_to_activity`, each gated
+ * on an explicit `confirm: true` so an agent has to surface the details to its
+ * user before writing. The chat/email tools are GraphQL reads only — `SignIn`
+ * mints an auth token but writes no data, and no generic GraphQL tool is
+ * exposed.
+ *
+ * One endpoint is not fixed in advance: `respond_to_activity` takes its path
+ * and HTTP method from the activity's own `actions`, because they genuinely
+ * vary. The client refuses to supply either if the server omits it, and
+ * refuses to send credentials to any host but api.holdsport.dk — so the set of
+ * reachable endpoints is still bounded, just not by this file alone.
  *
  * Credentials are passed on every tool call: each tool takes `username` and
  * `password` (and optional `team_id` / `base_url`) in its arguments, and a fresh
@@ -273,7 +279,48 @@ tool(
       maxPages: a.max_pages,
     }),
 );
+tool(
+  "attendance_actions",
+  {
+    title: "Responses an activity accepts",
+    description:
+      "What Holdsport will accept for an activity right now. An empty list means " +
+      "registration is closed. Read this before offering the user a choice.",
+    inputSchema: { activity_id: z.string().describe("Activity id") },
+  },
+  (client, a) => client.attendanceActions(a.activity_id),
+);
 
+tool(
+  "respond_to_activity",
+  {
+    title: "Answer an activity — WRITES",
+    description:
+      "Sign up for or withdraw from an activity. **This writes to Holdsport.** Show the " +
+      "user which activity and which answer, and get their approval, before setting " +
+      "`confirm: true`. The request is built from the activity's own allowed actions and " +
+      "re-read immediately beforehand, so a closed registration fails rather than being " +
+      "forced.",
+    inputSchema: {
+      activity_id: z.string().describe("Activity id"),
+      response: z
+        .enum(["attend", "decline"])
+        .describe("attend = Tilmeld, decline = Afmeld"),
+      confirm: z
+        .boolean()
+        .describe("Must be true to write. Ask the user first."),
+    },
+  },
+  (client, a) => {
+    if (a.confirm !== true) {
+      throw new Error(
+        "refusing to write: confirm must be true. Show the user the activity and " +
+          "the answer, and get their approval first.",
+      );
+    }
+    return client.respondToActivity(a.activity_id, a.response, { confirm: true });
+  },
+);
 tool(
   "activity",
   {

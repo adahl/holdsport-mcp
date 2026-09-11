@@ -35,11 +35,12 @@ Two front-ends over one shared data layer:
 
 ### Read-only by design — preserve this
 
-Everything is a read except `createActivity` / `updateActivity`. Deliberate safety properties that must not be eroded:
+Everything is a read except `createActivity` / `updateActivity` / `respondToActivity`. Deliberate safety properties that must not be eroded:
 
 - No raw request/path/GraphQL escape hatch in the CLI or MCP tools. The one endpoint not fixed in advance is `respondToActivity`'s, which comes from the activity's own `actions` — bounded instead by refusing a missing path or method, and refusing any host but `api.holdsport.dk`.
 - **A new client capability needs an MCP tool.** The MCP server is the point of the package; leaving a method CLI-only quietly halves the feature.
 - Writes are gated: CLI `--yes` (dry-run/diff by default), MCP `confirm: true`.
+- `send()` is the client's **only** REST write transport and exists solely for `respondToActivity`. It is private, and callers never assemble a path — the path comes from the activity itself. It is also never *defaulted*: a missing `action_path` or `action_method` is refused, because defaulting them rebuilds the two things reading them from the server was meant to avoid.
 - No delete is exposed anywhere. The API *can* delete — `CancelActivity` with `mark_as_canceled: false` removes an activity outright (verified live) — but no command or tool wraps it, deliberately.
 
 ### Write-path invariants (verified against production — don't "simplify" them away)
@@ -53,6 +54,28 @@ Everything is a read except `createActivity` / `updateActivity`. Deliberate safe
 - The **sign-up deadline lives only in GraphQL** (`absolute_registration_deadline`), surfaced as `registration_deadline`. REST reports a closed activity solely as an empty `actions` array, so without the GraphQL field a closure can be detected but never explained — and "Tilmeldingsfristen er overskredet" is precisely what the app shows the user. Note it is often null even when a deadline exists in prose: one cup carries "Deadline for tilmelding er 30. august" in its *title* and no structured field at all.
 - `activitiesInRange` **throws** when it exhausts `maxPages` without reaching the end of the window. A truncated list is indistinguishable from a complete one, and a caller would report "nothing scheduled" for a range it never reached. Verified live: the server returns empty pages past the end rather than clamping, so this fires only on genuine truncation — and `current_page` merely echoes the page you asked for, so it is no use as a stop signal.
 - Activity capacity is `max_attender`, and **Holdsport writes "no limit" as the sentinel 999**, not as an absent value. `ActivitySummary.max_attendees` normalises 999/0/absent to `null`, because otherwise every ordinary session reads "50 of 999".
+
+### Answering an activity (`respondToActivity`)
+
+Signing up or withdrawing is the one REST write. It never constructs the request:
+
+- **The path, HTTP method and body all come from the activity's own `actions`.** They genuinely vary, and the full cycle is verified live (Tilmeld then Afmeld on one activity):
+
+  | state | offered | request |
+  | --- | --- | --- |
+  | no row yet | Tilmeld *and* Afmeld | `POST /v1/activities/:id/activities_users` |
+  | Tilmeldt | Afmeld only | `PUT  /v1/activities/:id/activities_users/:rowId` |
+  | Afmeldt | Tilmeld only | `PUT  /v1/activities/:id/activities_users/:rowId` |
+
+  Two consequences. Once a row exists the API offers **only the opposite
+  action**, so a caller must read what is on offer rather than assume both.
+  And a hardcoded `POST` for the second answer would create a *second*
+  attendance row rather than update the first — that is the concrete failure
+  this design prevents, observed rather than inferred.
+- The same reasoning forbids *defaulting* the pieces: a missing `action_path` or `action_method` is refused, since supplying either rebuilds what reading them from the server was meant to avoid. `send()` also refuses any host but `api.holdsport.dk`, because that path is response data and the request carries HTTP Basic credentials.
+- **The actions are re-read immediately before writing.** A plan made an hour earlier may offer a choice the server no longer accepts; the fresh read turns that into a loud failure rather than a forced write.
+- An empty `actions` array means registration is closed. Refuse; never fall back to a constructed POST.
+- `joined_status` 1 = attending, 2 = not attending — the same semantics as the `status_code` on an attendance row.
 
 ## Tests
 
