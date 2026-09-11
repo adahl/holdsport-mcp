@@ -1748,6 +1748,132 @@ describe("myAttendance", () => {
   });
 });
 
+describe("respondToActivity", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const OPEN = {
+    id: 900,
+    action_path: "/v1/activities/900/activities_users",
+    action_method: "POST",
+    actions: [
+      { activities_user: { user_id: 42, picked: 1, joined_status: 1, name: "Tilmeld" } },
+      { activities_user: { user_id: 42, picked: 1, joined_status: 2, name: "Afmeld" } },
+    ],
+  };
+
+  /** Record every request so the write can be asserted exactly. */
+  function stubActivity(activity: unknown): {
+    calls: () => Array<{ method: string; path: string; body: unknown }>;
+  } {
+    const calls: Array<{ method: string; path: string; body: unknown }> = [];
+    stubFetch((url, init) => {
+      const u = new URL(url);
+      calls.push({
+        method: init.method ?? "GET",
+        path: u.pathname,
+        body: init.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      if ((init.method ?? "GET") === "GET") return json(activity);
+      return json({ ok: true });
+    });
+    return { calls: () => calls };
+  }
+
+  it("refuses to write without an explicit confirm", async () => {
+    stubActivity(OPEN);
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "attend"),
+    ).rejects.toThrow(/refusing to write/);
+  });
+
+  it("sends the server's own body, path and method verbatim", async () => {
+    const { calls } = stubActivity(OPEN);
+    const r = await new HoldsportClient(baseConfig).respondToActivity(
+      900,
+      "attend",
+      { confirm: true },
+    );
+    expect(r).toEqual({ name: "Tilmeld", joined_status: 1 });
+
+    const write = calls().find((c) => c.method !== "GET")!;
+    expect(write.method).toBe("POST");
+    expect(write.path).toBe("/v1/activities/900/activities_users");
+    // The label the UI shows is not part of the payload.
+    expect(write.body).toEqual({
+      activities_user: { user_id: 42, picked: 1, joined_status: 1 },
+    });
+  });
+
+  it("uses PUT and a row-specific path when the server says so", async () => {
+    // Changing an existing answer targets the row, not the collection.
+    const { calls } = stubActivity({
+      ...OPEN,
+      action_method: "PUT",
+      action_path: "/v1/activities/900/activities_users/555",
+    });
+    await new HoldsportClient(baseConfig).respondToActivity(900, "decline", {
+      confirm: true,
+    });
+    const write = calls().find((c) => c.method !== "GET")!;
+    expect(write.method).toBe("PUT");
+    expect(write.path).toBe("/v1/activities/900/activities_users/555");
+    expect(write.body).toEqual({
+      activities_user: { user_id: 42, picked: 1, joined_status: 2 },
+    });
+  });
+
+  it("refuses when registration has closed", async () => {
+    // A real closed activity answers with an empty actions array.
+    stubActivity({ ...OPEN, actions: [] });
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "decline", {
+        confirm: true,
+      }),
+    ).rejects.toThrow(/accepts no response right now/);
+  });
+
+  it("refuses when the wanted answer is not on offer", async () => {
+    stubActivity({
+      ...OPEN,
+      actions: [
+        { activities_user: { user_id: 42, picked: 1, joined_status: 2, name: "Afmeld" } },
+      ],
+    });
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "attend", {
+        confirm: true,
+      }),
+    ).rejects.toThrow(/offers no "attend" option/);
+  });
+
+  it("re-reads the activity immediately before writing", async () => {
+    // A plan drawn up an hour ago may offer a choice the server no longer
+    // takes; the fresh read is what turns that into a loud failure.
+    const { calls } = stubActivity(OPEN);
+    await new HoldsportClient(baseConfig).respondToActivity(900, "attend", {
+      confirm: true,
+    });
+    expect(calls()[0]!.method).toBe("GET");
+    expect(calls()[0]!.path).toBe("/v1/activities/900");
+  });
+
+  it("surfaces a server rejection rather than reporting success", async () => {
+    stubFetch((url, init) =>
+      (init.method ?? "GET") === "GET"
+        ? json(OPEN)
+        : json({ error: "too late" }, 422, "Unprocessable Entity"),
+    );
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "attend", {
+        confirm: true,
+      }),
+    ).rejects.toThrow(/HTTP 422/);
+  });
+});
+
 describe("activity capacity", () => {
   const originalFetch = globalThis.fetch;
   afterEach(() => {
@@ -1986,5 +2112,90 @@ describe("myAttendance guards its window like its sibling", () => {
     // yet" would offer to sign up someone who already has an answer recorded.
     expect(got[2]!.code).toBe(0);
     expect(got[2]!.label).toBe("Ukendt");
+  });
+});
+
+describe("respondToActivity refuses to invent a request", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const OPEN_ACTIONS = [
+    { activities_user: { user_id: 42, picked: 1, joined_status: 1, name: "Tilmeld" } },
+    { activities_user: { user_id: 42, picked: 1, joined_status: 2, name: "Afmeld" } },
+  ];
+
+  /** Serve one activity and record any write that escapes. */
+  function stubActivity(activity: unknown): { writes: () => string[] } {
+    const writes: string[] = [];
+    stubFetch((url, init) => {
+      if ((init.method ?? "GET") !== "GET") {
+        writes.push(`${init.method} ${url}`);
+        return json({ ok: true });
+      }
+      return json(activity);
+    });
+    return { writes: () => writes };
+  }
+
+  it("refuses when the server offers responses but no path", async () => {
+    // Defaulting to "" would POST the payload at the API root.
+    const { writes } = stubActivity({
+      id: 900,
+      action_method: "POST",
+      actions: OPEN_ACTIONS,
+    });
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "attend", { confirm: true }),
+    ).rejects.toThrow(/no action_path/);
+    expect(writes()).toEqual([]);
+  });
+
+  it("refuses when the method is missing, rather than assuming POST", async () => {
+    // The dangerous shape: a row-specific path with no method. Assuming POST
+    // would create a second row instead of updating the existing answer.
+    const { writes } = stubActivity({
+      id: 900,
+      action_path: "/v1/activities/900/activities_users/555",
+      actions: OPEN_ACTIONS,
+    });
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "decline", { confirm: true }),
+    ).rejects.toThrow(/no action_method/);
+    expect(writes()).toEqual([]);
+  });
+
+  it("will not send credentials to a host the server chose", async () => {
+    // action_path is response data, and the request carries HTTP Basic auth.
+    const { writes } = stubActivity({
+      id: 900,
+      action_method: "POST",
+      action_path: "https://evil.example.com/v1/activities/900/activities_users",
+      actions: OPEN_ACTIONS,
+    });
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "attend", { confirm: true }),
+    ).rejects.toThrow(/refusing to send credentials to evil.example.com/);
+    expect(writes()).toEqual([]);
+  });
+
+  it("drops an action whose joined_status is not a real answer", async () => {
+    // Number(undefined) is NaN, which would slip past the closed-registration
+    // refusal and then match nothing, reporting "available: Tilmeld (NaN)".
+    stubActivity({
+      id: 900,
+      action_method: "POST",
+      action_path: "/v1/activities/900/activities_users",
+      actions: [
+        { activities_user: { user_id: 42, name: "Tilmeld" } },
+        { activities_user: { user_id: 42, joined_status: "nonsense", name: "Afmeld" } },
+      ],
+    });
+    const client = new HoldsportClient(baseConfig);
+    expect(await client.attendanceActions(900)).toEqual([]);
+    await expect(
+      client.respondToActivity(900, "attend", { confirm: true }),
+    ).rejects.toThrow(/accepts no response right now/);
   });
 });

@@ -439,6 +439,27 @@ function offeredAnswers(
 }
 
 /**
+ * One response the server will accept for an activity right now.
+ *
+ * The body is the server's own, echoed back verbatim rather than rebuilt: the
+ * payload, the path and even the HTTP method vary per activity (POST to create
+ * a row when registration is open, PUT to a row-specific path when updating an
+ * existing answer), and inventing any of them is how a write silently targets
+ * the wrong thing.
+ */
+export interface AttendanceAction {
+  /** The server's own label — "Tilmeld" / "Afmeld". */
+  name: string;
+  /** 1 = attending, 2 = not attending. */
+  joined_status: number;
+  /** Verbatim request body. */
+  body: Record<string, unknown>;
+  /** Verbatim path and method from the activity. */
+  path: string;
+  method: string;
+}
+
+/**
  * Validate a paging window.
  *
  * Shared because both paging methods compare dates as strings: an unpadded
@@ -1005,6 +1026,61 @@ export class HoldsportClient {
     }
   }
 
+  /**
+   * Perform an authenticated write and return the parsed body.
+   *
+   * This is the **only** REST write path in the client and exists solely for
+   * {@link respondToActivity}. Private on purpose: there is still no arbitrary
+   * request escape hatch, and the path is never assembled by a caller — it
+   * comes from the activity's own `action_path`.
+   */
+  private async send(
+    method: string,
+    path: string,
+    body: unknown,
+  ): Promise<unknown> {
+    const url = new URL(
+      path.startsWith("http")
+        ? path
+        : `${DEFAULT_BASE_URL}/${path.replace(/^\/*(v1\/)?/, "")}`,
+    );
+
+    // This path is response data, not something assembled here, and the
+    // request carries HTTP Basic credentials. An absolute action_path pointing
+    // anywhere else would hand the user's Holdsport password to that host.
+    if (url.host !== new URL(DEFAULT_BASE_URL).host) {
+      throw new Error(
+        `refusing to send credentials to ${url.host}; expected ${new URL(DEFAULT_BASE_URL).host}`,
+      );
+    }
+    const auth = Buffer.from(
+      `${this.config.username}:${this.config.password}`,
+    ).toString("base64");
+
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Basic ${auth}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(
+        `HTTP ${res.status} ${res.statusText} for ${method} ${url.pathname}\n${text}`,
+      );
+    }
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
   /** Resolve the target team from an explicit id, else the configured default. */
   private resolveTeam(teamId?: string): string {
     const team = teamId ?? this.config.teamId;
@@ -1074,6 +1150,111 @@ export class HoldsportClient {
 
   listNotes(teamId?: string): Promise<unknown> {
     return this.get(`teams/${this.resolveTeam(teamId)}/notes`);
+  }
+
+  /**
+   * The responses Holdsport will accept for an activity *right now*.
+   *
+   * Read fresh rather than taken from an earlier listing: registration closes,
+   * and a plan drawn up an hour ago may be offering a choice the server will
+   * no longer take. An empty array means exactly that.
+   */
+  async attendanceActions(
+    activityId: string | number,
+  ): Promise<AttendanceAction[]> {
+    const a = (await this.get(`activities/${activityId}`)) as {
+      actions?: Array<{ activities_user?: Record<string, unknown> }> | null;
+      action_path?: string;
+      action_method?: string;
+    } | null;
+    if (!a) throw new Error(`activity ${activityId} not found`);
+
+    const offered = a.actions ?? [];
+
+    // Defaulting these would rebuild the two things this method exists not to
+    // rebuild. A missing path with a non-empty actions array would POST the
+    // payload at the API root; a present row-specific path with a missing
+    // method would POST to a row — the "write lands on the wrong row" case the
+    // design is built to prevent. Both are refusals, not defaults.
+    const path = a.action_path?.trim();
+    const method = a.action_method?.trim();
+    if (offered.length > 0 && (!path || !method)) {
+      throw new Error(
+        `activity ${activityId} offers responses but no ${
+          !path ? "action_path" : "action_method"
+        }; refusing to guess how to submit one`,
+      );
+    }
+
+    return offered.flatMap((x) => {
+      const u = x.activities_user;
+      if (!u) return [];
+      // 1 = attending, 2 = not attending. Anything else — absent, non-numeric,
+      // or a code this client does not know — is dropped rather than carried
+      // as NaN, which would slip past the closed-registration refusal and then
+      // fail to match anything.
+      const joined = Number(u.joined_status);
+      if (joined !== 1 && joined !== 2) return [];
+      return [
+        {
+          name: String(u.name ?? ""),
+          joined_status: joined,
+          // Echoed back exactly as given, minus the label the UI uses.
+          // The server's own payload, minus the label the UI shows.
+          // JSON.stringify drops an undefined value, so the wire body is the
+          // server's verbatim.
+          body: { activities_user: { ...u, name: undefined } },
+          path: path!,
+          method: method!,
+        },
+      ];
+    });
+  }
+
+  /**
+   * Answer an activity — sign up or withdraw. **This writes to production.**
+   *
+   * The one REST write in this client. Three things keep it narrow:
+   *
+   * - It refuses without `confirm: true`, like the activity write paths.
+   * - It never builds the request. The path, the HTTP method and the body all
+   *   come from the activity's own `actions` — which vary: POST to create a
+   *   row while registration is open, PUT to a row-specific path to change an
+   *   existing answer.
+   * - It re-reads those actions immediately before writing, so a closed
+   *   registration fails loudly instead of being forced.
+   */
+  async respondToActivity(
+    activityId: string | number,
+    want: "attend" | "decline",
+    opts: { confirm?: boolean } = {},
+  ): Promise<{ name: string; joined_status: number }> {
+    const actions = await this.attendanceActions(activityId);
+    if (actions.length === 0) {
+      throw new Error(
+        `activity ${activityId} accepts no response right now ` +
+          "(registration closed, or it is not yours to answer)",
+      );
+    }
+
+    const wanted = want === "attend" ? 1 : 2;
+    const action = actions.find((x) => x.joined_status === wanted);
+    if (!action) {
+      throw new Error(
+        `activity ${activityId} offers no "${want}" option; available: ` +
+          actions.map((x) => `${x.name} (${x.joined_status})`).join(", "),
+      );
+    }
+
+    if (opts.confirm !== true) {
+      throw new Error(
+        `refusing to write: pass confirm: true to answer "${action.name}" ` +
+          `on activity ${activityId}`,
+      );
+    }
+
+    await this.send(action.method, action.path, action.body);
+    return { name: action.name, joined_status: action.joined_status };
   }
 
   listTasks(activityId: string): Promise<unknown> {

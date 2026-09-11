@@ -12,7 +12,7 @@ Two binaries share the same underlying client:
 - **`bin/holdsport`** — the CLI (rosters, schedule, attendance, chat, email) for the terminal.
 - **`bin/holdsport-mcp`** — the MCP server, exposing the same commands as tools.
 
-All commands are **read-only** except two deliberate writes — creating and editing an activity — each gated behind an explicit `--yes` on the CLI and a `confirm: true` argument on the MCP tool (see [Creating & editing activities](#creating--editing-activities-the-only-writes)). Everything else cannot modify data, making it safe to connect to an agent.
+All commands are **read-only** except three deliberate writes — creating an activity, editing one, and answering one on your behalf — each gated behind an explicit `--yes` on the CLI or a `confirm: true` argument on the MCP tool. Everything else cannot modify data.
 
 To install on your local machine, using Claude Cowork, see: [Register with Claude Cowork](#register-with-claude-cowork)
 
@@ -94,7 +94,9 @@ What to know before using the writes:
 
 ## MCP server
 
-Every MCP tool maps to a specific operation, with no raw request/path escape hatch, so an agent driving it can never reach an unintended endpoint. All tools are reads except `create_activity` and `update_activity` (see [Creating & editing activities](#creating--editing-activities-the-only-writes)), which require an explicit `confirm: true` argument — their descriptions instruct the agent to show the user the details and get approval before setting it. The chat/email tools are read-only, and no generic GraphQL tool is exposed.
+Every MCP tool maps to a specific operation, with no raw request/path escape hatch. All tools are reads except `create_activity`, `update_activity` and `respond_to_activity`, which require an explicit `confirm: true` argument — their descriptions instruct the agent to show the user the details and get approval before setting it.
+
+`respond_to_activity` is the one endpoint not fixed in advance: the path and HTTP method come from the activity's own `actions`, because they genuinely vary (a POST to create an answer, a PUT to a row-specific path to change one). The client refuses to supply either if the server omits it, and refuses to send credentials to any host other than `api.holdsport.dk`. `attendance_actions` surfaces that same path so a caller can see what would be submitted before approving it. The chat/email tools are read-only, and no generic GraphQL tool is exposed.
 
 Credentials are passed on **every tool call**: each tool takes `username` and `password` arguments (team-scoped tools also take `team_id`), and a fresh client is built per call. The server itself takes no arguments and holds no credentials — the MCP host supplies them with each invocation.
 
@@ -123,4 +125,4 @@ See also: [https://coworkerai.io/guide/mcp-setup](https://coworkerai.io/guide/mc
 
 ### Tools
 
-`teams`, `members`, `member`, `roster`, `notes`, `activities`, `activities_in_range`, `my_attendance`, `activity`, `event_types`, `create_activity`, `update_activity`, `tasks`, `user`, `profiles`, `chats`, `chat`, `emails`, and `email`. Every tool requires `username` and `password`; team-scoped tools also need a `team_id`. The GraphQL tools (`chats`, `chat`, `emails`, `email`, `activities`, `activity`, `event_types`, `create_activity`, `update_activity`) authenticate over GraphQL, so their `username` must be the **login username**, not the email. `create_activity` and `update_activity` are the only tools that write; everything else is read-only.
+`teams`, `members`, `member`, `roster`, `notes`, `activities`, `activities_in_range`, `my_attendance`, `attendance_actions`, `respond_to_activity`, `activity`, `event_types`, `create_activity`, `update_activity`, `tasks`, `user`, `profiles`, `chats`, `chat`, `emails`, and `email`. Every tool requires `username` and `password`; team-scoped tools also need a `team_id`. The GraphQL tools (`chats`, `chat`, `emails`, `email`, `activities`, `activity`, `event_types`, `create_activity`, `update_activity`) authenticate over GraphQL, so their `username` must be the **login username**, not the email. `create_activity` and `update_activity` are the only tools that write; everything else is read-only.
