@@ -357,6 +357,39 @@ function activityDay(a: ActivitySummary): string {
 }
 
 /**
+ * Your own sign-up on one activity, read from REST.
+ *
+ * The authority is your row in the activity's `activities_users` list — *not*
+ * the activity's top-level `status` field. The two disagree: on a team whose
+ * activities sign everyone up by default, the row reads `Tilmeldt` while the
+ * top-level field still reads 0, because that field only reflects an explicit
+ * action of yours. Verified against production on two accounts with opposite
+ * conventions.
+ */
+export interface MyAttendance {
+  activity_id: number;
+  /** Server status code from your row; `-1` when you have no row at all. */
+  code: number;
+  /**
+   * The server's own label — `Tilmeldt`, `Afmeldt`, `Ukendt`, … — passed
+   * through verbatim rather than mapped, since the code set is open (an
+   * availability activity answers 5/`Ukendt`). `""` when you have no row.
+   */
+  label: string;
+  /** When you last changed it, ISO-8601; `""` when you have no row. */
+  updated_at: string;
+  /**
+   * Whether Holdsport will accept a change right now.
+   *
+   * False once registration closes. The activity list already carries the
+   * allowed `actions`, so this costs nothing extra — and without it a caller
+   * offers a choice the server will refuse, which reads to the user as the
+   * tool being broken rather than the deadline having passed.
+   */
+  can_respond: boolean;
+}
+
+/**
  * Validate a paging window.
  *
  * Shared because both paging methods compare dates as strings: an unpadded
@@ -380,6 +413,19 @@ function checkWindow(
   if (!Number.isInteger(maxPages) || maxPages < 1) {
     throw new Error(`maxPages must be a positive whole number, got ${maxPages}`);
   }
+}
+
+/** The shape we read out of a REST activity row. */
+interface RestActivity {
+  id: number;
+  starttime?: string;
+  actions?: Array<{ activities_user?: unknown } | null> | null;
+  activities_users?: Array<{
+    user_id?: number;
+    status?: string;
+    status_code?: number;
+    updated_at?: string;
+  }> | null;
 }
 
 /**
@@ -1345,6 +1391,99 @@ export class HoldsportClient {
     }
 
     return kept.sort((a, b) => a.time.localeCompare(b.time));
+  }
+
+  /**
+   * Your own sign-up for each activity in a date window, keyed by activity id.
+   *
+   * This is the one read that goes to **REST** rather than GraphQL: the
+   * documented `teams/:id/activities` endpoint carries the caller's attendance
+   * inline, so a whole team's worth costs one request per page — where GraphQL
+   * would need a per-activity round-trip and name-matching against the
+   * attendee lists.
+   *
+   * Unlike {@link listActivities}, REST pages are 1-based (`page=1` is the
+   * first) and take an explicit `per_page`.
+   */
+  async myAttendance(
+    opts: {
+      teamId?: string;
+      from?: string;
+      to?: string;
+      maxPages?: number;
+    } = {},
+  ): Promise<Record<number, MyAttendance>> {
+    const team = this.resolveTeam(opts.teamId);
+    const from = opts.from ?? teamToday();
+    const { to } = opts;
+    const maxPages = opts.maxPages ?? 12;
+
+    checkWindow(from, to, maxPages);
+
+    const me = (await this.getUser()) as { id?: number } | null;
+    const myId = me?.id;
+    if (typeof myId !== "number") {
+      throw new Error("could not read your own user id from GET /user");
+    }
+
+    const found: Record<number, MyAttendance> = {};
+    let exhausted = true;
+
+    for (let page = 1; page <= maxPages; page++) {
+      const rows =
+        ((await this.get(
+          `teams/${team}/activities?date=${encodeURIComponent(from)}` +
+            `&page=${page}&per_page=50`,
+        )) as RestActivity[] | null) ?? [];
+      if (rows.length === 0) {
+        exhausted = false;
+        break;
+      }
+
+      for (const a of rows) {
+        const day = a.starttime ? toWallClock(a.starttime).date : "";
+        if (to !== undefined && day > to) continue;
+        const mine = (a.activities_users ?? []).find(
+          (u) => u.user_id === myId,
+        );
+        found[a.id] = {
+          activity_id: a.id,
+          // -1 means "no row at all", so it has to come from the row being
+          // absent. A row that exists with no status_code is a different
+          // state, and a caller branching on -1 to mean "not asked yet" would
+          // offer to sign up someone who already has an answer recorded.
+          code: mine === undefined ? -1 : (mine.status_code ?? 0),
+          label: (mine?.status ?? "").trim(),
+          updated_at: mine?.updated_at ?? "",
+          // An entry without an activities_user carries no answer, so an
+          // activity holding only those accepts nothing despite a non-empty
+          // array. Counting the array's length would call it open and the
+          // write would then be refused.
+          can_respond: (a.actions ?? []).some((x) => x?.activities_user),
+        };
+      }
+
+      const last = rows[rows.length - 1]!;
+      const lastDay = last.starttime ? toWallClock(last.starttime).date : "";
+      if (to !== undefined && lastDay > to) {
+        exhausted = false;
+        break;
+      }
+    }
+
+    // Same reasoning as activitiesInRange: a partial map is indistinguishable
+    // from a complete one, so a caller would report "no sign-up recorded" for
+    // activities it simply never fetched. Note the page budgets are not
+    // comparable — REST pages here hold 50, GraphQL pages do not — so a
+    // maxPages tuned for one method truncates the other.
+    if (exhausted) {
+      throw new Error(
+        `myAttendance stopped at the ${maxPages}-page limit without reaching ` +
+          `the end of the window; raise maxPages or narrow the range`,
+      );
+    }
+
+    return found;
   }
 
   /**
