@@ -1542,6 +1542,166 @@ describe("activitiesInRange", () => {
   });
 });
 
+describe("myAttendance", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const ME = 4235495;
+
+  /** Serve GET /user then 1-based pages of REST activities. */
+  function stubRest(pages: unknown[][]): { paths: () => string[] } {
+    const paths: string[] = [];
+    stubFetch((url) => {
+      const path = new URL(url).pathname + new URL(url).search;
+      paths.push(path);
+      if (path.endsWith("/user")) return json({ id: ME, firstname: "Alex" });
+      const page = Number(new URL(url).searchParams.get("page"));
+      return json(pages[page - 1] ?? []);
+    });
+    return { paths: () => paths };
+  }
+
+  /** A real action entry: the server nests the answer under activities_user. */
+  const OFFERED = [{ activities_user: { joined_status: 1, name: "Tilmeld" } }];
+
+  const act = (
+    id: number,
+    start: string,
+    users: unknown[] = [],
+    actions: unknown[] = OFFERED,
+  ) => ({
+    id,
+    starttime: start,
+    activities_users: users,
+    actions,
+  });
+
+  it("reads your own row, not the activity's top-level status", async () => {
+    // The case that matters: a team whose activities sign everyone up by
+    // default reports status 0 at the top level while the row says Tilmeldt.
+    // Trusting the top-level field would report "no answer" for someone who is
+    // in fact attending. Verified against production.
+    stubRest([
+      [
+        {
+          ...act(1, "2026-06-04T16:00:00+02:00", [
+            { user_id: 999, status: "Afmeldt", status_code: 2 },
+            {
+              user_id: ME,
+              status: "Tilmeldt",
+              status_code: 1,
+              updated_at: "2026-05-30T10:00:00+02:00",
+            },
+          ]),
+          status: 0,
+        },
+      ],
+      [],
+    ]);
+
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(got[1]).toEqual({
+      activity_id: 1,
+      code: 1,
+      label: "Tilmeldt",
+      updated_at: "2026-05-30T10:00:00+02:00",
+      can_respond: true,
+    });
+  });
+
+  it("reports no answer when you have no row at all", async () => {
+    stubRest([
+      [act(2, "2026-06-04T16:00:00+02:00", [{ user_id: 999, status: "Tilmeldt", status_code: 1 }])],
+      [],
+    ]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+    });
+    expect(got[2]).toEqual({
+      activity_id: 2,
+      code: -1,
+      label: "",
+      updated_at: "",
+      can_respond: true,
+    });
+  });
+
+  it("passes an unfamiliar status through verbatim", async () => {
+    // An availability activity answers 5/"Ukendt"; the code set is open, so the
+    // server's own word is kept rather than mapped to something invented.
+    stubRest([
+      [act(3, "2026-06-04T16:00:00+02:00", [
+        { user_id: ME, status: "Ukendt", status_code: 5, updated_at: "x" },
+      ])],
+      [],
+    ]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+    });
+    expect(got[3].code).toBe(5);
+    expect(got[3].label).toBe("Ukendt");
+  });
+
+  it("uses 1-based REST pages and stops on the first empty one", async () => {
+    const { paths } = stubRest([
+      [act(1, "2026-06-04T16:00:00+02:00")],
+      [],
+      [act(9, "2026-06-05T16:00:00+02:00")],
+    ]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(Object.keys(got)).toEqual(["1"]);
+    const activityPaths = paths().filter((p) => p.includes("/activities"));
+    expect(activityPaths[0]).toContain("page=1"); // not page=0, unlike GraphQL
+    expect(activityPaths).toHaveLength(2);
+  });
+
+  it("excludes activities past the window and stops once a page passes it", async () => {
+    const { paths } = stubRest([
+      [act(1, "2026-06-04T16:00:00+02:00"), act(2, "2026-06-20T16:00:00+02:00")],
+      [act(3, "2026-06-25T16:00:00+02:00")],
+    ]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+      to: "2026-06-10",
+    });
+    expect(Object.keys(got)).toEqual(["1"]);
+    expect(paths().filter((p) => p.includes("/activities"))).toHaveLength(1);
+  });
+
+  it("judges the window by the Danish calendar day", async () => {
+    // 00:30 on 1 July is 22:30Z on 30 June — inside the window by instant,
+    // outside it by the day a person means.
+    stubRest([[act(1, "2026-07-01T00:30:00+02:00")], []]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(Object.keys(got)).toEqual([]);
+  });
+
+  it("throws when it cannot establish who you are", async () => {
+    stubFetch(() => json({ firstname: "Alex" })); // no id
+    await expect(
+      new HoldsportClient(baseConfig).myAttendance({ teamId: "1001" }),
+    ).rejects.toThrow(/could not read your own user id/);
+  });
+});
+
 describe("activity capacity", () => {
   const originalFetch = globalThis.fetch;
   afterEach(() => {
@@ -1580,6 +1740,50 @@ describe("activity capacity", () => {
     const rows = await new HoldsportClient(chatConfig).listActivities({ teamId: "1001" });
     expect(rows.map((r) => r.max_attendees)).toEqual([null, null]);
     expect(rows.map((r) => r.has_waiting_list)).toEqual([false, false]);
+  });
+});
+
+describe("myAttendance reports whether a change is still possible", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("marks an activity with no offered actions as closed", async () => {
+    // A closed registration answers with an empty actions array. Surfacing it
+    // here means a caller never offers a choice the server will refuse.
+    stubFetch((url) => {
+      if (String(url).endsWith("/user")) return json({ id: 7 });
+      // Page 2 is empty, which is how the server signals the end — serving a
+      // full page forever would now be read as truncation, correctly.
+      if (Number(new URL(String(url)).searchParams.get("page")) > 1) return json([]);
+      return json([
+        { id: 1, starttime: "2026-06-04T16:00:00+02:00", actions: [], activities_users: [] },
+        {
+          id: 2,
+          starttime: "2026-06-05T16:00:00+02:00",
+          actions: [{ activities_user: { joined_status: 2, name: "Afmeld" } }],
+          activities_users: [],
+        },
+        {
+          id: 3,
+          starttime: "2026-06-06T16:00:00+02:00",
+          // A non-empty array carrying no answer accepts nothing.
+          actions: [{}, {}],
+          activities_users: [],
+        },
+      ]);
+    });
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(got[1]!.can_respond).toBe(false);
+    expect(got[2]!.can_respond).toBe(true);
+    // Entries with no activities_user carry no answer, so this accepts nothing
+    // — counting the array's length would have called it open.
+    expect(got[3]!.can_respond).toBe(false);
   });
 });
 
@@ -1658,5 +1862,83 @@ describe("date helpers", () => {
       day: "2-digit",
     }).format(new Date());
     expect(teamToday()).toBe(danish);
+  });
+});
+
+describe("myAttendance guards its window like its sibling", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /** A page budget's worth of activities that never runs out. */
+  function stubEndless(): void {
+    stubFetch((url) => {
+      if (String(url).endsWith("/user")) return json({ id: 7 });
+      const page = Number(new URL(String(url)).searchParams.get("page"));
+      return json([
+        {
+          id: page,
+          starttime: `2026-06-${String((page % 28) + 1).padStart(2, "0")}T16:00:00+02:00`,
+          actions: [],
+          activities_users: [],
+        },
+      ]);
+    });
+  }
+
+  it("refuses rather than returning a map truncated at maxPages", async () => {
+    // The sibling throws for this reason; returning a partial map would have
+    // the caller report "no sign-up recorded" for activities never fetched.
+    stubEndless();
+    await expect(
+      new HoldsportClient(baseConfig).myAttendance({
+        teamId: "1001",
+        from: "2026-06-01",
+        to: "2026-12-31",
+        maxPages: 3,
+      }),
+    ).rejects.toThrow(/stopped at the 3-page limit/);
+  });
+
+  it("rejects a date that is not zero-padded", async () => {
+    stubEndless();
+    await expect(
+      new HoldsportClient(baseConfig).myAttendance({
+        teamId: "1001",
+        from: "2026-06-01",
+        to: "2026-6-30",
+      }),
+    ).rejects.toThrow(/to must be YYYY-MM-DD/);
+  });
+
+  it("rejects a maxPages that would fetch nothing", async () => {
+    stubEndless();
+    // Returning {} here is indistinguishable from "this team has no activities".
+    await expect(
+      new HoldsportClient(baseConfig).myAttendance({ teamId: "1001", maxPages: 0 }),
+    ).rejects.toThrow(/maxPages must be a positive whole number/);
+  });
+
+  it("separates having no row from having a row with no status", async () => {
+    stubFetch((url) => {
+      if (String(url).endsWith("/user")) return json({ id: 7 });
+      if (Number(new URL(String(url)).searchParams.get("page")) > 1) return json([]);
+      return json([
+        { id: 1, starttime: "2026-06-04T16:00:00+02:00", actions: [], activities_users: [] },
+        {
+          id: 2,
+          starttime: "2026-06-05T16:00:00+02:00",
+          actions: [],
+          activities_users: [{ user_id: 7, status: "Ukendt", updated_at: "2026-06-01T09:00:00+02:00" }],
+        },
+      ]);
+    });
+    const got = await new HoldsportClient(baseConfig).myAttendance({ teamId: "1001" });
+    expect(got[1]!.code).toBe(-1);
+    // A row exists, so -1 would be wrong — a caller reading it as "not asked
+    // yet" would offer to sign up someone who already has an answer recorded.
+    expect(got[2]!.code).toBe(0);
+    expect(got[2]!.label).toBe("Ukendt");
   });
 });
