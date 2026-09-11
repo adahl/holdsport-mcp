@@ -37,7 +37,8 @@ Two front-ends over one shared data layer:
 
 Everything is a read except `createActivity` / `updateActivity`. Deliberate safety properties that must not be eroded:
 
-- No raw request/path/GraphQL escape hatch in the CLI or MCP tools.
+- No raw request/path/GraphQL escape hatch in the CLI or MCP tools. The one endpoint not fixed in advance is `respondToActivity`'s, which comes from the activity's own `actions` — bounded instead by refusing a missing path or method, and refusing any host but `api.holdsport.dk`.
+- **A new client capability needs an MCP tool.** The MCP server is the point of the package; leaving a method CLI-only quietly halves the feature.
 - Writes are gated: CLI `--yes` (dry-run/diff by default), MCP `confirm: true`.
 - No delete is exposed anywhere. The API *can* delete — `CancelActivity` with `mark_as_canceled: false` removes an activity outright (verified live) — but no command or tool wraps it, deliberately.
 
@@ -49,6 +50,9 @@ Everything is a read except `createActivity` / `updateActivity`. Deliberate safe
 - Times on the wire are full `YYYY-MM-DD HH:MM` datetimes in `start_time`/`end_time` (the separate date fields are ignored by the server; a bare `HH:MM` lands on today). All wall-clock conversion uses `Europe/Copenhagen` (`TEAM_TZ` in client.ts).
 - Edits to repeating-series activities always send `update_current_and_future: false` — single occurrence only, hardcoded in both front-ends (`updateActivity` accepts a `repeatScope` option, but no front-end exposes `"future"`); one-off activities never carry the flag.
 - Activity `meeting_time` (Mødetid) maps to the API's `pickup_time` field.
+- The **sign-up deadline lives only in GraphQL** (`absolute_registration_deadline`), surfaced as `registration_deadline`. REST reports a closed activity solely as an empty `actions` array, so without the GraphQL field a closure can be detected but never explained — and "Tilmeldingsfristen er overskredet" is precisely what the app shows the user. Note it is often null even when a deadline exists in prose: one cup carries "Deadline for tilmelding er 30. august" in its *title* and no structured field at all.
+- `activitiesInRange` **throws** when it exhausts `maxPages` without reaching the end of the window. A truncated list is indistinguishable from a complete one, and a caller would report "nothing scheduled" for a range it never reached. Verified live: the server returns empty pages past the end rather than clamping, so this fires only on genuine truncation — and `current_page` merely echoes the page you asked for, so it is no use as a stop signal.
+- Activity capacity is `max_attender`, and **Holdsport writes "no limit" as the sentinel 999**, not as an absent value. `ActivitySummary.max_attendees` normalises 999/0/absent to `null`, because otherwise every ordinary session reads "50 of 999".
 
 ## Tests
 

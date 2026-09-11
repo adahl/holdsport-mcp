@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 
 import {
+  addDays,
   type Config,
   clearChatTokenCache,
   HoldsportClient,
   loadConfig,
+  teamToday,
 } from "../src/client.ts";
 
 const baseConfig: Config = {
@@ -655,6 +657,9 @@ describe("HoldsportClient activities (GraphQL)", () => {
               endtime: { iso8601: "2026-06-05T20:00:00+02:00" },
               event_type: { name: "Kamp" },
               attendee_count: 12,
+      max_attendees: null,
+      has_waiting_list: false,
+      registration_deadline: "",
             },
           ],
         },
@@ -670,6 +675,9 @@ describe("HoldsportClient activities (GraphQL)", () => {
               endtime: { iso8601: "2026-06-04T17:40:00+02:00" },
               event_type: { name: "Træning" },
               attendee_count: 22,
+      max_attendees: null,
+      has_waiting_list: false,
+      registration_deadline: "",
             },
           ],
         },
@@ -690,6 +698,10 @@ describe("HoldsportClient activities (GraphQL)", () => {
       event_type: "Træning",
       is_cancelled: false,
       attendee_count: 22,
+      max_attendees: null,
+      has_waiting_list: false,
+      registration_deadline: "",
+      teams: [],
     });
     expect(rows[1].is_cancelled).toBe(true);
     expect(rows[1].meeting_time).toBe(""); // no pickup_time in the fixture
@@ -725,6 +737,9 @@ describe("HoldsportClient activities (GraphQL)", () => {
         event_type: { name: "Træning" },
         type: 1,
         attendee_count: 3,
+    max_attendees: null,
+    has_waiting_list: false,
+    registration_deadline: "",
         player_count: 2,
         coach_count: 1,
         max_attender: 999,
@@ -741,7 +756,10 @@ describe("HoldsportClient activities (GraphQL)", () => {
       attending: 3,
       players: 2,
       coaches: 1,
-      max: 999,
+      // 999 is Holdsport's "no limit" sentinel, normalised here as it is in
+      // the summary — otherwise the same activity reads "50 of 999" from the
+      // detail tool and "50" from the list one.
+      max: 0,
     });
     expect(a.attendance.attending_players).toEqual(["Bo Berg #6", "Cy Cohen"]);
     expect(a.attendance.attending_coaches).toEqual(["Coach Ann"]);
@@ -861,6 +879,10 @@ describe("HoldsportClient.createActivity", () => {
       event_type: "Træning",
       is_cancelled: false,
       attendee_count: 0,
+      max_attendees: null,
+      has_waiting_list: false,
+      registration_deadline: "",
+      teams: [],
     });
   });
 
@@ -1333,5 +1355,308 @@ describe("HoldsportClient.updateActivity", () => {
     await expect(
       new HoldsportClient(chatConfig).updateActivity(55934876, { name: "Ny" }),
     ).rejects.toThrow(/returned no activity/);
+  });
+});
+
+describe("activitiesInRange", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearChatTokenCache();
+  });
+
+  /** A minimal GraphQL row; `start` is an ISO instant. */
+  const row = (id: number, start: string) => ({
+    id,
+    name: `A${id}`,
+    place: "Hallen",
+    is_cancelled: false,
+    starttime: { iso8601: start },
+    endtime: { iso8601: start },
+    event_type: { name: "Træning" },
+    attendee_count: 1,
+  });
+
+  /**
+   * Serve `pages[n]` for the 0-based page the client asks for; anything past
+   * the end comes back empty, like the real server.
+   */
+  function stubPages(pages: unknown[][]): { pageArgs: () => number[] } {
+    const pageArgs: number[] = [];
+    stubFetch((_url, init) => {
+      const body = JSON.parse(String(init.body));
+      if (body.query.includes("SignIn")) {
+        return json({ data: { SignIn: { access_token: "tok-123" } } });
+      }
+      const page = body.variables.page as number;
+      pageArgs.push(page);
+      return json({
+        data: {
+          activities_page: {
+            current_page: page,
+            activities_groups: [{ activities: pages[page] ?? [] }],
+          },
+        },
+      });
+    });
+    return { pageArgs: () => pageArgs };
+  }
+
+  it("stops at the first empty page", async () => {
+    const { pageArgs } = stubPages([
+      [row(1, "2026-06-04T16:00:00+02:00")],
+      [],
+      [row(3, "2026-06-06T16:00:00+02:00")],
+    ]);
+    const rows = await new HoldsportClient(chatConfig).activitiesInRange({
+      teamId: "37141",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(rows.map((r) => r.id)).toEqual([1]);
+    expect(pageArgs()).toEqual([0, 1]); // never asked for page 2
+  });
+
+  it("stops paging once a page has passed the window, and drops later rows", async () => {
+    const { pageArgs } = stubPages([
+      [row(1, "2026-06-04T16:00:00+02:00")],
+      [row(2, "2026-06-09T16:00:00+02:00"), row(3, "2026-06-20T16:00:00+02:00")],
+      [row(4, "2026-06-21T16:00:00+02:00")],
+    ]);
+    const rows = await new HoldsportClient(chatConfig).activitiesInRange({
+      teamId: "37141",
+      from: "2026-06-01",
+      to: "2026-06-10",
+    });
+    // 3 is past `to` so it is dropped, and its page ends the walk.
+    expect(rows.map((r) => r.id)).toEqual([1, 2]);
+    expect(pageArgs()).toEqual([0, 1]);
+  });
+
+  it("keeps a late-evening activity on the final day of the window", async () => {
+    // 23:30 Copenhagen on 30 June is 21:30Z the same day — but a 00:30 activity
+    // would be 22:30Z on the 29th. Both must be judged by the Danish calendar
+    // day, which is what a person means by "up to the 30th".
+    stubPages([
+      [
+        row(1, "2026-06-30T23:30:00+02:00"),
+        row(2, "2026-07-01T00:30:00+02:00"),
+      ],
+    ]);
+    const rows = await new HoldsportClient(chatConfig).activitiesInRange({
+      teamId: "37141",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(rows.map((r) => r.id)).toEqual([1]);
+  });
+
+  it("de-duplicates activities repeated across pages", async () => {
+    stubPages([
+      [row(1, "2026-06-04T16:00:00+02:00"), row(2, "2026-06-05T16:00:00+02:00")],
+      [row(2, "2026-06-05T16:00:00+02:00"), row(3, "2026-06-06T16:00:00+02:00")],
+      [],
+    ]);
+    const rows = await new HoldsportClient(chatConfig).activitiesInRange({
+      teamId: "37141",
+      from: "2026-06-01",
+      to: "2026-06-30",
+    });
+    expect(rows.map((r) => r.id)).toEqual([1, 2, 3]);
+  });
+
+  it("refuses rather than returning a list truncated at maxPages", async () => {
+    const endless = Array.from({ length: 20 }, (_, i) => [
+      row(i + 1, "2026-06-04T16:00:00+02:00"),
+    ]);
+    const { pageArgs } = stubPages(endless);
+    // A partial list is indistinguishable from a complete one, and a caller
+    // would report "nothing scheduled" for a window it never reached.
+    await expect(
+      new HoldsportClient(chatConfig).activitiesInRange({
+        teamId: "37141",
+        from: "2026-06-01",
+        to: "2026-12-31",
+        maxPages: 3,
+      }),
+    ).rejects.toThrow(/stopped at the 3-page limit/);
+    expect(pageArgs()).toEqual([0, 1, 2]);
+  });
+
+  it("rejects a date that is not zero-padded", async () => {
+    // Days are compared as strings, so "2026-6-30" would never match and the
+    // window would never close — burning every page and returning months of
+    // activities outside the range, with no error.
+    stubPages([[row(1, "2026-06-04T16:00:00+02:00")]]);
+    await expect(
+      new HoldsportClient(chatConfig).activitiesInRange({
+        teamId: "37141",
+        from: "2026-06-01",
+        to: "2026-6-30",
+      }),
+    ).rejects.toThrow(/to must be YYYY-MM-DD/);
+  });
+
+  it("rejects a maxPages that would fetch nothing", async () => {
+    stubPages([[row(1, "2026-06-04T16:00:00+02:00")]]);
+    await expect(
+      new HoldsportClient(chatConfig).activitiesInRange({
+        teamId: "37141",
+        maxPages: 0,
+      }),
+    ).rejects.toThrow(/maxPages must be a positive whole number/);
+  });
+
+  it("returns everything when no end date is given", async () => {
+    stubPages([[row(1, "2027-06-04T16:00:00+02:00")], []]);
+    const rows = await new HoldsportClient(chatConfig).activitiesInRange({
+      teamId: "37141",
+      from: "2026-06-01",
+    });
+    expect(rows.map((r) => r.id)).toEqual([1]);
+  });
+
+  it("carries the owning team name onto each row", async () => {
+    stubPages([
+      [
+        { ...row(1, "2026-06-04T16:00:00+02:00"), teams: [{ id: 9, name: "U13" }] },
+        {
+          ...row(2, "2026-06-05T16:00:00+02:00"),
+          teams: [{ id: 9, name: "U13" }, { id: 8, name: " U15 " }],
+        },
+        row(3, "2026-06-06T16:00:00+02:00"),
+      ],
+      [],
+    ]);
+    const rows = await new HoldsportClient(chatConfig).activitiesInRange({
+      teamId: "37141",
+      from: "2026-06-01",
+    });
+    expect(rows.map((r) => (r.teams ?? []).map((t) => t.name))).toEqual([
+      ["U13"],
+      ["U13", "U15"],
+      [],
+    ]);
+    expect((rows[1]?.teams ?? []).map((t) => t.id)).toEqual([9, 8]);
+  });
+});
+
+describe("activity capacity", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearChatTokenCache();
+  });
+
+  const row = (over: Record<string, unknown>) => ({
+    id: 1,
+    name: "Prøve at være målmand",
+    starttime: { iso8601: "2026-09-13T10:00:00+02:00" },
+    endtime: { iso8601: "2026-09-13T11:00:00+02:00" },
+    event_type: { name: "Medlemsaktivitet" },
+    attendee_count: 3,
+    ...over,
+  });
+
+  it("reports a real cap and its waiting list", async () => {
+    stubGraphql({ activityGroups: [{ activities: [row({ max_attender: 2, has_waiting_list: true })] }] });
+    const [a] = await new HoldsportClient(chatConfig).listActivities({ teamId: "1001" });
+    expect(a!.max_attendees).toBe(2);
+    expect(a!.has_waiting_list).toBe(true);
+    // Over its cap: further sign-ups land on the waiting list.
+    expect(a!.attendee_count).toBe(3);
+  });
+
+  it("treats Holdsport's 999 sentinel as uncapped", async () => {
+    // Every ordinary session carries 999; surfacing "50 of 999" would be noise.
+    stubGraphql({ activityGroups: [{ activities: [row({ max_attender: 999 })] }] });
+    const [a] = await new HoldsportClient(chatConfig).listActivities({ teamId: "1001" });
+    expect(a!.max_attendees).toBeNull();
+  });
+
+  it("treats a missing or zero cap as uncapped", async () => {
+    stubGraphql({ activityGroups: [{ activities: [row({ max_attender: 0 }), row({ id: 2 })] }] });
+    const rows = await new HoldsportClient(chatConfig).listActivities({ teamId: "1001" });
+    expect(rows.map((r) => r.max_attendees)).toEqual([null, null]);
+    expect(rows.map((r) => r.has_waiting_list)).toEqual([false, false]);
+  });
+});
+
+describe("registration deadline", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearChatTokenCache();
+  });
+
+  it("reports when sign-up closed", async () => {
+    // This is what "Tilmeldingsfristen er overskredet" means in the app. REST
+    // never exposes it — it reports only an empty actions array — so without
+    // this a closed activity can be detected but not explained.
+    stubGraphql({
+      activityGroups: [
+        {
+          activities: [
+            {
+              id: 1,
+              name: "Efterårsstævne",
+              starttime: { iso8601: "2026-09-19T08:00:00+02:00" },
+              endtime: { iso8601: "2026-09-19T17:00:00+02:00" },
+              absolute_registration_deadline: { iso8601: "2026-08-29T10:00:00Z" },
+            },
+          ],
+        },
+      ],
+    });
+    const [a] = await new HoldsportClient(chatConfig).listActivities({ teamId: "1001" });
+    expect(a!.registration_deadline).toBe("2026-08-29T10:00:00Z");
+  });
+
+  it("leaves it empty when no deadline is set", async () => {
+    stubGraphql({
+      activityGroups: [
+        {
+          activities: [
+            { id: 2, name: "Træning", starttime: { iso8601: "2026-09-16T18:10:00+02:00" } },
+          ],
+        },
+      ],
+    });
+    const [a] = await new HoldsportClient(chatConfig).listActivities({ teamId: "1001" });
+    expect(a!.registration_deadline).toBe("");
+  });
+});
+
+describe("date helpers", () => {
+  it("shifts a date across a DST transition without rounding", () => {
+    // Denmark loses an hour on 29 Mar and gains one on 25 Oct; anchoring at
+    // midday UTC keeps a whole-day shift on the day it belongs to.
+    expect(addDays("2026-10-24", 2)).toBe("2026-10-26");
+    expect(addDays("2026-03-28", 2)).toBe("2026-03-30");
+  });
+
+  it("goes backwards and across month and year ends", () => {
+    expect(addDays("2026-03-01", -1)).toBe("2026-02-28");
+    expect(addDays("2026-12-31", 1)).toBe("2027-01-01");
+    expect(addDays("2028-02-28", 1)).toBe("2028-02-29");
+  });
+
+  it("refuses a date it cannot parse", () => {
+    expect(() => addDays("2026-6-30", 1)).toThrow(/YYYY-MM-DD/);
+    expect(() => addDays("not a date", 1)).toThrow(/YYYY-MM-DD/);
+  });
+
+  it("reports today in the team's timezone, not the machine's", () => {
+    // The distinction that matters: teamToday follows Danish days even when
+    // the machine is elsewhere, which is why it exists alongside localToday.
+    expect(teamToday()).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    const danish = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Copenhagen",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+    expect(teamToday()).toBe(danish);
   });
 });

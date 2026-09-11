@@ -186,6 +186,34 @@ export interface ActivitySummary {
   is_cancelled: boolean;
   /** How many have signed up (players + coaches). */
   attendee_count: number;
+  /**
+   * Places available, or `null` when the activity is uncapped.
+   *
+   * Holdsport stores "no limit" as the sentinel 999 rather than as an absent
+   * value, so that is normalised away here — reporting "50 of 999" would be
+   * noise on every ordinary training session.
+   */
+  max_attendees?: number | null;
+  /** Whether a full activity puts further sign-ups on a waiting list. */
+  has_waiting_list?: boolean;
+  /**
+   * When sign-up closes, ISO-8601; `""` when there is no deadline set.
+   *
+   * The reason behind "Tilmeldingsfristen er overskredet" in the app. REST
+   * does not expose it at all — it only reports an empty `actions` array — so
+   * without this a closed activity can be detected but never explained.
+   */
+  registration_deadline?: string;
+  /**
+   * The teams whose calendar this activity sits on. Usually one; a session two
+   * squads share carries both. Kept as id + name rather than a joined string so
+   * a caller can tell *its own* team apart from the others it is shared with —
+   * by id, since a configured team name need not match the server's spelling.
+   *
+   * Optional so that adding it does not break anyone constructing an
+   * `ActivitySummary` by hand; `toActivitySummary` always populates it.
+   */
+  teams?: Array<{ id: number; name: string }>;
 }
 
 /** An event type a team's activities can be filed under. */
@@ -299,6 +327,59 @@ function toWallClock(iso: string): { date: string; time: string } {
     date: `${p.year}-${p.month}-${p.day}`,
     time: `${p.hour}:${p.minute}`,
   };
+}
+
+/**
+ * Today's calendar date in the *team's* timezone, `YYYY-MM-DD`. Distinct from
+ * {@link localToday}, which follows the machine — the two differ when the
+ * machine is abroad, and a date window should mean Danish days either way.
+ */
+export function teamToday(): string {
+  return toWallClock(new Date().toISOString()).date;
+}
+
+/**
+ * A `YYYY-MM-DD` calendar date shifted by `days`. Anchored at midday UTC so a
+ * DST transition can never round the result onto the neighbouring day.
+ */
+export function addDays(date: string, days: number): string {
+  const at = new Date(`${date}T12:00:00Z`);
+  if (Number.isNaN(at.getTime())) {
+    throw new Error(`date must be YYYY-MM-DD, got "${date}"`);
+  }
+  at.setUTCDate(at.getUTCDate() + days);
+  return at.toISOString().slice(0, 10);
+}
+
+/** An activity's calendar day in the team's timezone; `""` when it has no start. */
+function activityDay(a: ActivitySummary): string {
+  return a.time ? toWallClock(a.time).date : "";
+}
+
+/**
+ * Validate a paging window.
+ *
+ * Shared because both paging methods compare dates as strings: an unpadded
+ * "2026-6-30" sorts below every real date, so the window never closes and the
+ * call pages to its limit returning rows well outside the range. Having this
+ * in one place is what stops the two methods drifting apart again.
+ */
+function checkWindow(
+  from: string,
+  to: string | undefined,
+  maxPages: number,
+): void {
+  for (const [name, v] of [
+    ["from", from],
+    ["to", to],
+  ] as const) {
+    if (v !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+      throw new Error(`${name} must be YYYY-MM-DD, got "${v}"`);
+    }
+  }
+  if (!Number.isInteger(maxPages) || maxPages < 1) {
+    throw new Error(`maxPages must be a positive whole number, got ${maxPages}`);
+  }
 }
 
 /**
@@ -516,7 +597,11 @@ const ACTIVITY_FIELDS = `
     starttime { iso8601 }
     endtime { iso8601 }
     event_type { name }
-    attendee_count`;
+    attendee_count
+    max_attender
+    has_waiting_list
+    absolute_registration_deadline { iso8601 }
+    teams { id name }`;
 
 /**
  * The team's activities from `filter_start_date` onward, paginated and grouped
@@ -542,7 +627,6 @@ const SHOW_ACTIVITY = `query ShowActivity($id: Int!) {
     type
     player_count
     coach_count
-    max_attender
     attending_players { id name }
     attending_coaches { id name }
     non_attendees { id name }
@@ -645,7 +729,14 @@ interface RawActivity {
   endtime?: { iso8601?: string } | null;
   event_type?: { name?: string } | null;
   attendee_count?: number;
+  max_attender?: number | null;
+  has_waiting_list?: boolean | null;
+  absolute_registration_deadline?: { iso8601?: string } | null;
+  teams?: Array<{ id?: number; name?: string }> | null;
 }
+
+/** Holdsport's sentinel for "no limit". */
+const UNCAPPED = 999;
 
 /** Shape a raw GraphQL activity row for humans. */
 function toActivitySummary(a: RawActivity): ActivitySummary {
@@ -659,6 +750,18 @@ function toActivitySummary(a: RawActivity): ActivitySummary {
     event_type: (a.event_type?.name ?? "").trim(),
     is_cancelled: a.is_cancelled ?? false,
     attendee_count: a.attendee_count ?? 0,
+    max_attendees:
+      a.max_attender && a.max_attender > 0 && a.max_attender !== UNCAPPED
+        ? a.max_attender
+        : null,
+    has_waiting_list: a.has_waiting_list ?? false,
+    registration_deadline: a.absolute_registration_deadline?.iso8601 ?? "",
+    teams: (a.teams ?? [])
+      // Keyed on id, not name: a team whose name comes back blank is still a
+      // team the activity is shared with, and dropping it would tell a caller
+      // matching on id that the session is private.
+      .filter((t): t is { id: number; name?: string } => typeof t.id === "number")
+      .map((t) => ({ id: t.id, name: (t.name ?? "").trim() })),
   };
 }
 
@@ -1174,6 +1277,77 @@ export class HoldsportClient {
   }
 
   /**
+   * Every activity for a team inside an inclusive `from`..`to` date window,
+   * assembled by paging {@link listActivities}. The server has no end-date
+   * filter — `activities_page` takes only a start date — so the far edge of the
+   * window is applied here.
+   *
+   * Days are compared as *team-local* calendar days, not raw instants: a 00:30
+   * activity on the window's last day is 22:30Z the day before, and comparing
+   * ISO timestamps would drop it. Local days are what a person means by "the
+   * next month".
+   *
+   * Termination is deliberate: `activities_page` reports neither a total nor a
+   * has-more flag, so the loop stops on the first empty page, or once a page's
+   * last row has passed `to`, with `maxPages` as the backstop against a team
+   * whose calendar never runs out.
+   */
+  async activitiesInRange(
+    opts: {
+      teamId?: string;
+      from?: string;
+      to?: string;
+      maxPages?: number;
+    } = {},
+  ): Promise<ActivitySummary[]> {
+    const from = opts.from ?? teamToday();
+    const { to } = opts;
+    const maxPages = opts.maxPages ?? 12;
+    checkWindow(from, to, maxPages);
+
+    const seen = new Set<number>();
+    const kept: ActivitySummary[] = [];
+    let exhausted = true;
+
+    for (let page = 1; page <= maxPages; page++) {
+      const rows = await this.listActivities({
+        teamId: opts.teamId,
+        date: from,
+        page,
+      });
+      if (rows.length === 0) {
+        exhausted = false;
+        break;
+      }
+
+      for (const row of rows) {
+        if (to !== undefined && activityDay(row) > to) continue;
+        if (seen.has(row.id)) continue;
+        seen.add(row.id);
+        kept.push(row);
+      }
+
+      // Rows arrive sorted ascending, so the last one dates the page.
+      if (to !== undefined && activityDay(rows[rows.length - 1]!) > to) {
+        exhausted = false;
+        break;
+      }
+    }
+
+    // Running out of pages is not the same as running out of activities, and a
+    // truncated list is indistinguishable from a complete one — a caller would
+    // report "nothing scheduled in December" for a window it never reached.
+    if (exhausted) {
+      throw new Error(
+        `activitiesInRange stopped at the ${maxPages}-page limit without reaching ` +
+          `the end of the window; raise maxPages or narrow the range`,
+      );
+    }
+
+    return kept.sort((a, b) => a.time.localeCompare(b.time));
+  }
+
+  /**
    * The event types a team's activities can be filed under — the valid
    * `event_type_id` values for {@link createActivity}.
    */
@@ -1459,7 +1633,9 @@ export class HoldsportClient {
         attending: a.attendee_count ?? 0,
         players: a.player_count ?? 0,
         coaches: a.coach_count ?? 0,
-        max: a.max_attender ?? 0,
+        // Same sentinel as the summary: 999 means no limit, not a cap of 999.
+        max:
+          a.max_attender && a.max_attender !== UNCAPPED ? a.max_attender : 0,
       },
       attendance: {
         attending_players: names(a.attending_players),

@@ -47,6 +47,34 @@ const teamId = z
   .optional()
   .describe("Team id (required for team-scoped data)");
 
+/**
+ * A calendar date the tools can trust.
+ *
+ * These arguments come from a model, not a person, and dates are compared as
+ * strings downstream — an unpadded "2026-6-30" would silently never match, so
+ * the window would never close and the call would page to its limit returning
+ * activities well outside the range.
+ */
+// A factory rather than a shared instance: reusing one zod object makes the
+// generated JSON Schema emit a `$ref` for the second use, and not every MCP
+// client resolves those.
+const isoDate = (description: string) =>
+  z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD")
+    .optional()
+    .describe(description);
+
+/** A page budget that cannot be zero, negative or fractional. */
+const maxPages = () =>
+  z
+    .number()
+    .int()
+    .min(1)
+    .max(50)
+    .optional()
+    .describe("Safety cap on pages fetched (default: 12)");
+
 const registrationType = z
   .enum(
     Object.keys(REGISTRATION_TYPES) as [RegistrationType, ...RegistrationType[]],
@@ -187,12 +215,36 @@ tool(
       "`username` must be the login username, not the email.",
     inputSchema: {
       team_id: teamId,
-      date: z.string().optional().describe("Start date YYYY-MM-DD (default: today)"),
+      date: isoDate("Start date YYYY-MM-DD (default: today)"),
       page: z.number().optional().describe("Page number (default: 1)"),
     },
   },
   (client, a) =>
     client.listActivities({ teamId: a.team_id, date: a.date, page: a.page }),
+);
+
+tool(
+  "activities_in_range",
+  {
+    title: "Activities in a date window",
+    description:
+      "A team's activities between `from` and `to` (YYYY-MM-DD, inclusive), paging as " +
+      "needed. The API filters by start date only, so the far edge is applied here; " +
+      "days are compared in the team's timezone. `username` must be the login username.",
+    inputSchema: {
+      team_id: teamId,
+      from: isoDate("First day YYYY-MM-DD (default: today)"),
+      to: isoDate("Last day YYYY-MM-DD (default: no limit)"),
+      max_pages: maxPages(),
+    },
+  },
+  (client, a) =>
+    client.activitiesInRange({
+      teamId: a.team_id,
+      from: a.from,
+      to: a.to,
+      maxPages: a.max_pages,
+    }),
 );
 
 tool(
