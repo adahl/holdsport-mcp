@@ -371,9 +371,11 @@ export interface MyAttendance {
   /** Server status code from your row; `-1` when you have no row at all. */
   code: number;
   /**
-   * The server's own label — `Tilmeldt`, `Afmeldt`, `Ukendt`, … — passed
-   * through verbatim rather than mapped, since the code set is open (an
-   * availability activity answers 5/`Ukendt`). `""` when you have no row.
+   * The server's own label — `Tilmeldt`, `Afmeldt`, `Til rådighed`, `Ukendt`,
+   * … — passed through verbatim rather than mapped, since the code set is open.
+   * An availability activity, where the coach picks the squad, answers
+   * 3/`Til rådighed`; 5/`Ukendt` is a row created by rostering the whole squad
+   * onto an activity, before you have answered. `""` when you have no row.
    */
   label: string;
   /** When you last changed it, ISO-8601; `""` when you have no row. */
@@ -387,6 +389,53 @@ export interface MyAttendance {
    * tool being broken rather than the deadline having passed.
    */
   can_respond: boolean;
+  /**
+   * The answers this activity is offering, as the server names them.
+   *
+   * Carried because *which* answers exist varies and a caller cannot infer
+   * them: an ordinary activity offers `Tilmeld`/`Afmeld`, while one where the
+   * coach picks the squad offers `Til rådighed`/`Afmeld` and no `Tilmeld` at
+   * all. A UI that hardcodes "Tilmeld" therefore promises the wrong thing —
+   * putting yourself forward for selection is not the same commitment as
+   * signing up, and the coach reads them differently.
+   *
+   * `joined_status` is the code the answer is *submitted* as — 0 for
+   * `Til rådighed`, 1 for `Tilmeld`, 2 for `Afmeld` — which is a different
+   * vocabulary from `code` above: the same "Til rådighed" reads back as 3.
+   *
+   * Free: the activity list already carries `actions`, the same array
+   * `can_respond` is derived from. `[]` exactly when `can_respond` is false.
+   */
+  offers: Array<{ name: string; joined_status: number }>;
+}
+
+/**
+ * The answers an activity's `actions` array is offering, parsed once.
+ *
+ * Both `offers` and `can_respond` on {@link MyAttendance} come from this, so an
+ * activity cannot be reported answerable while offering nothing a caller could
+ * actually submit.
+ */
+function offeredAnswers(
+  actions?: Array<{ activities_user?: unknown } | null> | null,
+): Array<{ name: string; joined_status: number }> {
+  return (actions ?? []).flatMap((x) => {
+    const u = x?.activities_user;
+    if (!u || typeof u !== "object") return [];
+    const row = u as Record<string, unknown>;
+    // An absent or non-numeric code is dropped rather than carried as NaN,
+    // which would count as an answer on offer and then match nothing. A
+    // numeric code this client does not recognise is kept — the server is the
+    // authority on what it will accept.
+    //
+    // null and "" are excluded explicitly because Number() turns both into 0,
+    // and 0 is a real answer ("Til rådighed") rather than a rejected sentinel.
+    const raw = row.joined_status;
+    if (raw === null || raw === undefined || raw === "") return [];
+    const joined = Number(raw);
+    if (!Number.isFinite(joined)) return [];
+    return [{ name: String(row.name ?? ""), joined_status: joined }];
+  });
 }
 
 /**
@@ -1446,6 +1495,7 @@ export class HoldsportClient {
         const mine = (a.activities_users ?? []).find(
           (u) => u.user_id === myId,
         );
+        const offers = offeredAnswers(a.actions);
         found[a.id] = {
           activity_id: a.id,
           // -1 means "no row at all", so it has to come from the row being
@@ -1459,7 +1509,12 @@ export class HoldsportClient {
           // activity holding only those accepts nothing despite a non-empty
           // array. Counting the array's length would call it open and the
           // write would then be refused.
-          can_respond: (a.actions ?? []).some((x) => x?.activities_user),
+          //
+          // Derived from the same parse as `offers`, so "answerable" means an
+          // answer is actually on offer rather than merely that the array was
+          // non-empty.
+          offers,
+          can_respond: offers.length > 0,
         };
       }
 

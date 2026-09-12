@@ -254,7 +254,10 @@ tool(
       "Whether you are signed up for each of a team's activities in a date window, keyed " +
       "by activity id. Read from your own attendance row rather than the activity's " +
       "top-level status field, which disagrees with it on teams that register everyone " +
-      "by default. `can_respond` is false once registration has closed.",
+      "by default. `can_respond` is false once registration has closed. `offers` lists " +
+      "the answers the activity accepts, by the server's own names: not always Tilmeld " +
+      "and Afmeld — where the coach picks the squad the positive answer is 'Til rådighed', " +
+      "and once that is set only Afmeld remains. Offer the user those words, not Tilmeld.",
     inputSchema: {
       team_id: teamId,
       from: isoDate("First day YYYY-MM-DD (default: today)"),
