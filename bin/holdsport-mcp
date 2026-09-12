@@ -305,7 +305,12 @@ tool(
       activity_id: z.string().describe("Activity id"),
       response: z
         .enum(["attend", "decline"])
-        .describe("attend = Tilmeld, decline = Afmeld"),
+        .describe(
+          "attend = whichever positive answer this activity offers, decline = Afmeld. " +
+            "Not always Tilmeld: a game or cup where the coach picks the squad offers " +
+            "'Til rådighed' instead, and attend sends that. The result reports which " +
+            "was actually sent — tell the user that word, not the one you asked for.",
+        ),
       confirm: z
         .boolean()
         .describe("Must be true to write. Ask the user first."),

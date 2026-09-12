@@ -1782,11 +1782,77 @@ describe("respondToActivity", () => {
     return { calls: () => calls };
   }
 
+  /**
+   * A game or cup: the coach picks the squad, so the positive answer is
+   * "Til rådighed" (0) and Tilmeld (1) is never offered. Verified against
+   * production on activity 56942162, "RIK Halloween Cup 2026".
+   */
+  const AVAILABILITY = {
+    id: 900,
+    action_path: "/v1/activities/900/activities_users",
+    action_method: "POST",
+    actions: [
+      { activities_user: { user_id: 42, picked: 1, joined_status: 0, name: "Til rådighed" } },
+      { activities_user: { user_id: 42, picked: 1, joined_status: 2, name: "Afmeld" } },
+    ],
+  };
+
   it("refuses to write without an explicit confirm", async () => {
     stubActivity(OPEN);
     await expect(
       new HoldsportClient(baseConfig).respondToActivity(900, "attend"),
     ).rejects.toThrow(/refusing to write/);
+  });
+
+  it("attends an availability activity with the answer it actually offers", async () => {
+    // Mapping "attend" to a fixed joined_status of 1 failed here with
+    // `offers no "attend" option; available: Afmeld (2)` — the 0 having been
+    // dropped as an unknown code before it could be chosen.
+    const { calls } = stubActivity(AVAILABILITY);
+    const r = await new HoldsportClient(baseConfig).respondToActivity(
+      900,
+      "attend",
+      { confirm: true },
+    );
+    // The caller asked to attend and is told which word was sent, because the
+    // two mean different things to the coach.
+    expect(r).toEqual({ name: "Til rådighed", joined_status: 0 });
+
+    const write = calls().find((c) => c.method !== "GET")!;
+    expect(write.body).toEqual({
+      activities_user: { user_id: 42, picked: 1, joined_status: 0 },
+    });
+  });
+
+  it("still declines an availability activity with Afmeld", async () => {
+    // 2 is the negative answer on every activity; only the positive one moves.
+    const { calls } = stubActivity(AVAILABILITY);
+    const r = await new HoldsportClient(baseConfig).respondToActivity(
+      900,
+      "decline",
+      { confirm: true },
+    );
+    expect(r).toEqual({ name: "Afmeld", joined_status: 2 });
+    expect(calls().find((c) => c.method !== "GET")!.body).toEqual({
+      activities_user: { user_id: 42, picked: 1, joined_status: 2 },
+    });
+  });
+
+  it("refuses to guess when two positive answers are offered", async () => {
+    // Not a shape seen in production. If it ever appears, sending one of them
+    // silently would answer on the user's behalf.
+    stubActivity({
+      ...OPEN,
+      actions: [
+        ...OPEN.actions,
+        { activities_user: { user_id: 42, picked: 1, joined_status: 0, name: "Til rådighed" } },
+      ],
+    });
+    await expect(
+      new HoldsportClient(baseConfig).respondToActivity(900, "attend", {
+        confirm: true,
+      }),
+    ).rejects.toThrow(/more than one "attend" option.*refusing to guess/s);
   });
 
   it("sends the server's own body, path and method verbatim", async () => {
@@ -2183,6 +2249,10 @@ describe("respondToActivity refuses to invent a request", () => {
   it("drops an action whose joined_status is not a real answer", async () => {
     // Number(undefined) is NaN, which would slip past the closed-registration
     // refusal and then match nothing, reporting "available: Tilmeld (NaN)".
+    //
+    // null and "" are here because Number() turns both into 0, and 0 stopped
+    // being a rejected sentinel once it became "Til rådighed" — without an
+    // explicit guard a missing code would read as a positive answer.
     stubActivity({
       id: 900,
       action_method: "POST",
@@ -2190,6 +2260,8 @@ describe("respondToActivity refuses to invent a request", () => {
       actions: [
         { activities_user: { user_id: 42, name: "Tilmeld" } },
         { activities_user: { user_id: 42, joined_status: "nonsense", name: "Afmeld" } },
+        { activities_user: { user_id: 42, joined_status: null, name: "Tilmeld" } },
+        { activities_user: { user_id: 42, joined_status: "", name: "Tilmeld" } },
       ],
     });
     const client = new HoldsportClient(baseConfig);
@@ -2197,5 +2269,23 @@ describe("respondToActivity refuses to invent a request", () => {
     await expect(
       client.respondToActivity(900, "attend", { confirm: true }),
     ).rejects.toThrow(/accepts no response right now/);
+  });
+
+  it("keeps a numeric code it does not recognise", async () => {
+    // The server is the authority on what it accepts. Filtering to a known set
+    // is what hid "Til rådighed"; a future fourth answer should surface rather
+    // than vanish.
+    stubActivity({
+      id: 900,
+      action_method: "POST",
+      action_path: "/v1/activities/900/activities_users",
+      actions: [
+        { activities_user: { user_id: 42, joined_status: 7, name: "Noget nyt" } },
+      ],
+    });
+    const offered = await new HoldsportClient(baseConfig).attendanceActions(900);
+    expect(offered.map((o) => [o.name, o.joined_status])).toEqual([
+      ["Noget nyt", 7],
+    ]);
   });
 });

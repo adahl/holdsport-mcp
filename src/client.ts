@@ -412,21 +412,26 @@ export interface MyAttendance {
 /**
  * The answers an activity's `actions` array is offering, parsed once.
  *
- * Both `offers` and `can_respond` on {@link MyAttendance} come from this, so an
- * activity cannot be reported answerable while offering nothing a caller could
- * actually submit.
+ * Shared by {@link HoldsportClient.attendanceActions} and by `offers` and
+ * `can_respond` on {@link MyAttendance}, so reading and writing cannot disagree
+ * about what an activity accepts. They did: the write path kept only codes 1
+ * and 2, so an availability activity reported "Til rådighed" on offer and
+ * attendanceActions then discarded it, leaving only Afmeld to submit.
+ *
+ * `user` is the server's own row, which attendanceActions echoes back verbatim
+ * as the request body.
  */
 function offeredAnswers(
   actions?: Array<{ activities_user?: unknown } | null> | null,
-): Array<{ name: string; joined_status: number }> {
+): Array<{ name: string; joined_status: number; user: Record<string, unknown> }> {
   return (actions ?? []).flatMap((x) => {
     const u = x?.activities_user;
     if (!u || typeof u !== "object") return [];
     const row = u as Record<string, unknown>;
     // An absent or non-numeric code is dropped rather than carried as NaN,
-    // which would count as an answer on offer and then match nothing. A
-    // numeric code this client does not recognise is kept — the server is the
-    // authority on what it will accept.
+    // which would slip past the closed-registration refusal and then match
+    // nothing. A numeric code this client does not recognise is kept — the
+    // server is the authority on what it will accept.
     //
     // null and "" are excluded explicitly because Number() turns both into 0,
     // and 0 is a real answer ("Til rådighed") rather than a rejected sentinel.
@@ -434,7 +439,7 @@ function offeredAnswers(
     if (raw === null || raw === undefined || raw === "") return [];
     const joined = Number(raw);
     if (!Number.isFinite(joined)) return [];
-    return [{ name: String(row.name ?? ""), joined_status: joined }];
+    return [{ name: String(row.name ?? ""), joined_status: joined, user: row }];
   });
 }
 
@@ -448,9 +453,20 @@ function offeredAnswers(
  * the wrong thing.
  */
 export interface AttendanceAction {
-  /** The server's own label — "Tilmeld" / "Afmeld". */
+  /** The server's own label — "Tilmeld" / "Afmeld" / "Til rådighed". */
   name: string;
-  /** 1 = attending, 2 = not attending. */
+  /**
+   * The code this answer submits. 2 is always "not attending"; the positive
+   * answer is 1 (`Tilmeld`) on an ordinary activity but **0** (`Til rådighed`)
+   * on one where the coach picks the squad from those who put themselves
+   * forward — such an activity never offers 1 at all.
+   *
+   * Deliberately not narrowed to a union: this is whatever the server offered,
+   * and the set is open. Do not assume a positive answer is 1.
+   *
+   * Note this is a *different* vocabulary from {@link MyAttendance.code},
+   * which reads back 3 for the same "Til rådighed" answer this writes as 0.
+   */
   joined_status: number;
   /** Verbatim request body. */
   body: Record<string, unknown>;
@@ -1186,29 +1202,15 @@ export class HoldsportClient {
       );
     }
 
-    return offered.flatMap((x) => {
-      const u = x.activities_user;
-      if (!u) return [];
-      // 1 = attending, 2 = not attending. Anything else — absent, non-numeric,
-      // or a code this client does not know — is dropped rather than carried
-      // as NaN, which would slip past the closed-registration refusal and then
-      // fail to match anything.
-      const joined = Number(u.joined_status);
-      if (joined !== 1 && joined !== 2) return [];
-      return [
-        {
-          name: String(u.name ?? ""),
-          joined_status: joined,
-          // Echoed back exactly as given, minus the label the UI uses.
-          // The server's own payload, minus the label the UI shows.
-          // JSON.stringify drops an undefined value, so the wire body is the
-          // server's verbatim.
-          body: { activities_user: { ...u, name: undefined } },
-          path: path!,
-          method: method!,
-        },
-      ];
-    });
+    return offeredAnswers(offered).map((o) => ({
+      name: o.name,
+      joined_status: o.joined_status,
+      // The server's own payload, minus the label the UI shows. JSON.stringify
+      // drops an undefined value, so the wire body is the server's verbatim.
+      body: { activities_user: { ...o.user, name: undefined } },
+      path: path!,
+      method: method!,
+    }));
   }
 
   /**
@@ -1237,14 +1239,40 @@ export class HoldsportClient {
       );
     }
 
-    const wanted = want === "attend" ? 1 : 2;
-    const action = actions.find((x) => x.joined_status === wanted);
-    if (!action) {
+    // The intent stays binary; which code carries it is the server's to decide.
+    //
+    // Holdsport's negative answer is always 2. Its positive answer is not
+    // always 1: a game or cup where the coach picks the squad offers
+    // "Til rådighed" (0) and never offers 1 at all. Both mean "count me in" to
+    // the person answering, so resolving the intent against what is actually
+    // offered is what keeps "attend" working on every kind of activity. Mapping
+    // the word to a fixed code instead is what made signing up for a cup fail
+    // with `offers no "attend" option; available: Afmeld (2)`.
+    const DECLINE = 2;
+    const candidates = actions.filter((x) =>
+      want === "decline"
+        ? x.joined_status === DECLINE
+        : x.joined_status !== DECLINE,
+    );
+
+    if (candidates.length === 0) {
       throw new Error(
         `activity ${activityId} offers no "${want}" option; available: ` +
           actions.map((x) => `${x.name} (${x.joined_status})`).join(", "),
       );
     }
+    // Never guess. One positive answer is the shape every activity seen so far
+    // takes, and picking one of two would silently send an answer the caller
+    // did not choose — the exact failure this method's "never invent a request"
+    // design exists to prevent.
+    if (candidates.length > 1) {
+      throw new Error(
+        `activity ${activityId} offers more than one "${want}" option ` +
+          `(${candidates.map((x) => `${x.name} (${x.joined_status})`).join(", ")}); ` +
+          "refusing to guess which you meant",
+      );
+    }
+    const action = candidates[0]!;
 
     if (opts.confirm !== true) {
       throw new Error(
@@ -1691,10 +1719,14 @@ export class HoldsportClient {
           // array. Counting the array's length would call it open and the
           // write would then be refused.
           //
-          // Derived from the same parse as `offers`, so "answerable" means an
-          // answer is actually on offer rather than merely that the array was
-          // non-empty.
-          offers,
+          // Derived from the same parse the write path uses, so "answerable"
+          // here means "a write would find something to send" rather than
+          // merely "the array was non-empty". The raw row is the write path's
+          // concern and is not part of what a reader is told.
+          offers: offers.map((o) => ({
+            name: o.name,
+            joined_status: o.joined_status,
+          })),
           can_respond: offers.length > 0,
         };
       }
