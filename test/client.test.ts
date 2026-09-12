@@ -1613,6 +1613,7 @@ describe("myAttendance", () => {
       label: "Tilmeldt",
       updated_at: "2026-05-30T10:00:00+02:00",
       can_respond: true,
+      offers: [{ name: "Tilmeld", joined_status: 1 }],
     });
   });
 
@@ -1631,12 +1632,57 @@ describe("myAttendance", () => {
       label: "",
       updated_at: "",
       can_respond: true,
+      offers: [{ name: "Tilmeld", joined_status: 1 }],
     });
   });
 
+  it("reports the answers offered, including Til rådighed", async () => {
+    // A game or cup where the coach picks the squad offers "Til rådighed" (0)
+    // and no Tilmeld. Filtering offers to a known 1-or-2 set is what would hide
+    // it, leaving a caller to promise a sign-up the server does not accept.
+    stubRest([
+      [act(4, "2026-06-04T16:00:00+02:00", [], [
+        { activities_user: { joined_status: 0, name: "Til rådighed" } },
+        { activities_user: { joined_status: 2, name: "Afmeld" } },
+      ])],
+      [],
+    ]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+    });
+    expect(got[4].offers).toEqual([
+      { name: "Til rådighed", joined_status: 0 },
+      { name: "Afmeld", joined_status: 2 },
+    ]);
+    expect(got[4].can_respond).toBe(true);
+  });
+
+  it("does not count an answer with no usable code as on offer", async () => {
+    // null and "" are the dangerous ones: Number() turns both into 0, which is a
+    // real answer. Counted, they would report an activity answerable that
+    // offers nothing a caller could submit.
+    stubRest([
+      [act(5, "2026-06-04T16:00:00+02:00", [], [
+        { activities_user: { joined_status: null, name: "Tilmeld" } },
+        { activities_user: { joined_status: "", name: "Tilmeld" } },
+        { activities_user: { joined_status: "nonsense", name: "Afmeld" } },
+        { activities_user: { name: "Afmeld" } },
+      ])],
+      [],
+    ]);
+    const got = await new HoldsportClient(baseConfig).myAttendance({
+      teamId: "1001",
+      from: "2026-06-01",
+    });
+    expect(got[5].offers).toEqual([]);
+    expect(got[5].can_respond).toBe(false);
+  });
+
   it("passes an unfamiliar status through verbatim", async () => {
-    // An availability activity answers 5/"Ukendt"; the code set is open, so the
-    // server's own word is kept rather than mapped to something invented.
+    // 5/"Ukendt" is a row created by rostering the whole squad, before anyone
+    // has answered. The code set is open, so the server's own word is kept
+    // rather than mapped to something invented.
     stubRest([
       [act(3, "2026-06-04T16:00:00+02:00", [
         { user_id: ME, status: "Ukendt", status_code: 5, updated_at: "x" },
